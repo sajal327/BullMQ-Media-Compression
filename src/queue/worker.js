@@ -5,7 +5,6 @@ import { markCompleted, markFailed } from "../services/post.service.js";
 import { logger } from "../utils/logger.js";
 import { Post } from "../models/post.model.js";
 import { Revolution } from "../models/revolution.model.js";
-import { Follow } from "../models/follow.model.js";
 import { User } from "../models/user.model.js";
 import kycDocument from "../models/kycDocument.js";
 import { invalidatePublicFeedCache } from "../utils/feedCache.js";
@@ -21,11 +20,14 @@ const publishProgress = async (key, progress) => {
     if (redis?.status !== "ready") return;
     await redis.set(`progress:${key}`, progress, "EX", 600);
   } catch (err) {
-    logger.warn("Progress error", err.message);
+    logger.warn({
+      err,
+      event: "progress_error",
+    });
   }
 };
 
-const withTimeout = (promise, ms = 1800000) =>
+const withTimeout = (promise, ms = 840000) =>
   Promise.race([
     promise,
     new Promise((_, reject) =>
@@ -45,15 +47,6 @@ const normalizeKey = (url) => {
 };
 
 /* ------------------ CACHE BUST ------------------ */
-
-/**
- * After media processing completes:
- * 1. Delete the PROCESSING stub everyone was seeing
- * 2. Delete the creator's raw-key cache (from the patch in feed.controller)
- * 3. Re-cache a properly populated post so the next read is a cache HIT
- * 4. Ensure the post is in the correct feed sorted set
- * 5. Fanout: update all follower feed sorted sets
- */
 
 const bustAndRecache = async (postId, ownerId) => {
   if (redis?.status !== "ready") return;
@@ -78,7 +71,6 @@ const bustAndRecache = async (postId, ownerId) => {
 
     const score = new Date(populated.createdAt).getTime();
     const postIdStr = postId.toString();
-
     const ownerIdStr =
       typeof ownerId === "object"
         ? ownerId._id?.toString()
@@ -92,30 +84,22 @@ const bustAndRecache = async (postId, ownerId) => {
 
     const pipeline = redis.pipeline();
 
-    // Remove stale caches
     pipeline.del(`v1:post:${postIdStr}`);
     pipeline.del(`post:${postIdStr}`);
     pipeline.del(`post:${postIdStr}:creator:${ownerIdStr}`);
-
-    // Re-cache fresh completed post
     pipeline.set(`v1:post:${postIdStr}`, JSON.stringify(cacheObj), "EX", 300);
-
-    // Ensure feed references exist
     pipeline.zadd(`feed:user:${ownerIdStr}`, score, postIdStr);
 
     if (populated.feedType === "PUBLIC") {
       pipeline.zadd("feed:public", score, postIdStr);
     }
-
     if (populated.feedType === "PRIME") {
       pipeline.zadd("v1:feed:prime", score, postIdStr);
     }
 
     await pipeline.exec();
-
     await invalidatePublicFeedCache();
 
-    // Bust shared first-page caches
     const sharedKeyPatterns = [
       "primefeed:v1:shared:ALL:*",
       "primefeed:v1:shared:NATIONAL:*",
@@ -124,20 +108,24 @@ const bustAndRecache = async (postId, ownerId) => {
     for (const pattern of sharedKeyPatterns) {
       try {
         const keys = await redis.keys(pattern);
-
-        if (keys.length) {
-          await redis.del(...keys);
-        }
+        if (keys.length) await redis.del(...keys);
       } catch (err) {
         logger.warn(`Failed to bust shared cache: ${err.message}`);
       }
     }
 
-    logger.info(`Cache busted and re-cached for post: ${postIdStr}`);
+    logger.info({
+      event: "cache_busted",
+      postId,
+      ownerId,
+    });
   } catch (err) {
-    console.error("========== BUST CACHE ERROR ==========");
-    console.error(err);
-    console.error(err?.stack);
+    logger.error({
+      err,
+      event: "cache_rebuild_failed",
+      postId,
+      ownerId,
+    });
 
     try {
       await redis.del(`v1:post:${postId}`);
@@ -151,7 +139,9 @@ const bustAndRecache = async (postId, ownerId) => {
 
 export const startWorker = () => {
   if (global.__mediaWorker) {
-    console.log("Worker already running");
+    logger.warn({
+      event: "worker_already_running",
+    });
     return;
   }
 
@@ -159,21 +149,44 @@ export const startWorker = () => {
     QUEUE_NAME,
     async (job) => {
       const { name, data } = job;
-      console.log("⚡ Job:", job.id, name);
+      // job_started removed – use active event instead
+      const jobStart = Date.now(); // for duration tracking
 
       try {
+        /* ================================================
+           media-processing
+        ================================================ */
         if (name === "media-processing") {
           const { postId, images, video, version } = data;
+
+          logger.info({
+            event: "media_processing_received",
+            jobId: job.id,
+            postId,
+            imageCount: images?.length ?? 0,
+            hasVideo: !!video,
+            version,
+          });
 
           const post = await Post.findById(postId).lean();
 
           if (!post) {
-            logger.warn(`Post deleted, skipping job: ${postId}`);
+            logger.warn({
+              event: "post_deleted",
+              postId,
+              jobId: job.id,
+            });
             return;
           }
 
           if (version && post.mediaVersion && version < post.mediaVersion) {
-            logger.info(`Skipping stale post job: ${postId}`);
+            logger.info({
+              event: "stale_job_skipped",
+              jobId: job.id,
+              postId,
+              version,
+              currentVersion: post.mediaVersion,
+            });
             return;
           }
 
@@ -191,38 +204,122 @@ export const startWorker = () => {
                   await publishProgress(postId, p);
                 }
               },
+
+              onEarlyImageThumbnails: async (thumbKeys) => {
+                logger.info({
+                  event: "early_image_thumbnails",
+                  postId,
+                  thumbKeys,
+                });
+                await Post.updateOne(
+                  { _id: postId },
+                  { $set: { imageThumbnails: thumbKeys } },
+                );
+                if (redis?.status === "ready") {
+                  // Use pipeline for two DELs
+                  await redis
+                    .pipeline()
+                    .del(`v1:post:${postId}`)
+                    .del(`post:${postId}`)
+                    .exec();
+                }
+              },
+
+              onEarlyVideoThumbnail: async (thumbKey) => {
+                logger.info({
+                  event: "early_video_thumbnail",
+                  postId,
+                  thumbKey,
+                });
+                await Post.updateOne(
+                  { _id: postId },
+                  { $set: { videoThumbnail: thumbKey } },
+                );
+                if (redis?.status === "ready") {
+                  const pipeline = redis.pipeline();
+                  pipeline.del(`v1:post:${postId}`);
+                  pipeline.del(`post:${postId}`);
+                  const ownerId =
+                    post.user?._id?.toString() ?? post.user?.toString();
+                  if (ownerId) {
+                    pipeline.del(`post:${postId}:creator:${ownerId}`);
+                  }
+                  await pipeline.exec();
+                }
+              },
             }),
           );
 
-          const cleanImages = (result.uploadedImages || []).map(normalizeKey);
-          const cleanVideo = normalizeKey(result.uploadedVideo);
+          logger.info({
+            event: "process_media_completed",
+            postId,
+            imageCount: result.uploadedImages?.length ?? 0,
+            thumbnailCount: result.uploadedImageThumbnails?.length ?? 0,
+            hasVideo: !!result.uploadedVideo,
+            hasVideoThumbnail: !!result.uploadedVideoThumbnail,
+          });
 
-          // markCompleted updates DB: sets images/video to compressed keys
-          // and mediaStatus = "COMPLETED"
+          const cleanImages = (result.uploadedImages || []).map(normalizeKey);
+          const cleanImageThumbnails = (
+            result.uploadedImageThumbnails || []
+          ).map(normalizeKey);
+          const cleanVideo = normalizeKey(result.uploadedVideo);
+          const cleanVideoThumbnail = normalizeKey(
+            result.uploadedVideoThumbnail,
+          );
+
           const updatedPost = await markCompleted(
             postId,
             cleanImages,
+            cleanImageThumbnails,
             cleanVideo,
+            cleanVideoThumbnail,
           );
 
           if (!updatedPost) {
-            logger.warn(`markCompleted returned null for post: ${postId}`);
+            logger.warn({
+              event: "mark_completed_null",
+              postId,
+            });
             return;
           }
 
-          // ── THE FIX: bust stale cache and re-cache with populated user ──
-          // await bustAndRecache(postId, updatedPost.user.toString());
-          await bustAndRecache(
-            postId,
-            updatedPost.user._id
-              ? updatedPost.user._id.toString()
-              : updatedPost.user.toString(),
-          );
-
           await publishProgress(postId, 100);
+
+          const ownerId = updatedPost.user._id
+            ? updatedPost.user._id.toString()
+            : updatedPost.user.toString();
+
+          // Fire‑and‑forget cache rebuild – do not await
+          setImmediate(async () => {
+            const cacheStart = Date.now();
+            try {
+              await bustAndRecache(postId, ownerId);
+              logger.info({
+                event: "cache_rebuilt",
+                postId,
+                durationMs: Date.now() - cacheStart,
+              });
+            } catch (err) {
+              logger.error({
+                event: "cache_rebuild_failed",
+                postId,
+                err,
+              });
+            }
+          });
+
+          logger.info({
+            event: "media_processing_finished",
+            postId,
+            durationMs: Date.now() - jobStart,
+          });
           return;
         }
 
+        /* ================================================
+           process-revolution-media
+        ================================================ */
         if (name === "process-revolution-media") {
           const { revolutionId, rawFiles, version } = data;
 
@@ -234,12 +331,14 @@ export const startWorker = () => {
             revolution.mediaVersion &&
             version < revolution.mediaVersion
           ) {
-            logger.info(`Skipping stale revolution job: ${revolutionId}`);
+            logger.info({
+              event: "stale_revolution_job_skipped",
+              revolutionId,
+            });
             return;
           }
 
           await publishProgress(revolutionId, 10);
-
           let last = 10;
 
           const result = await withTimeout(
@@ -255,9 +354,16 @@ export const startWorker = () => {
           );
 
           const processed = (result.uploadedFiles || []).map(normalizeKey);
+          const imageThumbnails = (result.uploadedImageThumbnails || []).map(
+            normalizeKey,
+          );
+          const videoThumbnail = normalizeKey(result.uploadedVideoThumbnail);
 
           revolution.files.processed = processed;
+          revolution.files.imageThumbnails = imageThumbnails;
+          revolution.files.videoThumbnail = videoThumbnail;
           revolution.mediaStatus = "COMPLETED";
+
           await revolution.save();
 
           if (redis?.status === "ready") {
@@ -265,7 +371,6 @@ export const startWorker = () => {
               redis.del(`revolution:${revolutionId}`),
               redis.incr("revolutionfeed:version"),
             ]);
-
             await redis.set(
               `revolution:${revolutionId}`,
               JSON.stringify(revolution.toObject()),
@@ -278,36 +383,39 @@ export const startWorker = () => {
           return;
         }
 
+        /* ================================================
+           process-kyc-media
+        ================================================ */
         if (name === "process-kyc-media") {
           const { kycId, frontImage, backImage, version } = data;
 
           const kyc = await kycDocument.findById(kycId);
-
           if (!kyc) {
-            logger.warn(`KYC deleted, skipping job: ${kycId}`);
+            logger.warn({
+              event: "kyc_deleted",
+              kycId,
+            });
             return;
           }
 
-          // Prevent stale jobs
           if (version && kyc.mediaVersion && version < kyc.mediaVersion) {
-            logger.info(`Skipping stale KYC job: ${kycId}`);
+            logger.info({
+              event: "stale_kyc_job_skipped",
+              kycId,
+            });
             return;
           }
 
           await publishProgress(kycId, 10);
-
           let last = 10;
 
           const result = await withTimeout(
             processMedia({
               files: [frontImage, backImage].filter(Boolean),
-
               imageUploadPath: "kyc/compressed",
-
               onProgress: async (p) => {
                 if (p >= last + 10 || p === 100) {
                   last = p;
-
                   await publishProgress(kycId, p);
                 }
               },
@@ -315,61 +423,61 @@ export const startWorker = () => {
           );
 
           const processed = (result.uploadedFiles || []).map(normalizeKey);
-
           const compressedFront = processed[0] || frontImage;
-
           const compressedBack = processed[1] || backImage;
 
-          // Update DB with compressed keys
           kyc.frontImage = compressedFront;
           kyc.backImage = compressedBack;
-
           kyc.mediaStatus = "COMPLETED";
 
           await kyc.save();
 
-          // Optional Redis cleanup
           if (redis?.status === "ready") {
             await redis.del(`kyc:${kycId}`);
           }
 
           await publishProgress(kycId, 100);
-
-          logger.info(`KYC processing completed: ${kycId}`);
-
+          logger.info({
+            event: "kyc_processing_completed",
+            kycId,
+          });
           return;
         }
 
+        /* ================================================
+           process-profile-media
+        ================================================ */
         if (name === "process-profile-media") {
           const { userId, profilePic, coverPic, version } = data;
 
           const user = await User.findById(userId);
-
           if (!user) {
-            logger.warn(`User deleted, skipping job: ${userId}`);
+            logger.warn({
+              event: "user_deleted",
+              userId,
+            });
             return;
           }
 
-          // Prevent stale jobs
           if (
             version &&
             user.profileMediaVersion &&
             version < user.profileMediaVersion
           ) {
-            logger.info(`Skipping stale profile job: ${userId}`);
+            logger.info({
+              event: "stale_profile_job_skipped",
+              userId,
+            });
             return;
           }
 
           await publishProgress(userId, 10);
-
           let last = 10;
 
           const result = await withTimeout(
             processMedia({
               files: [profilePic, coverPic].filter(Boolean),
-
               imageUploadPath: "profiles/compressed",
-
               onProgress: async (p) => {
                 if (p >= last + 10 || p === 100) {
                   last = p;
@@ -380,24 +488,20 @@ export const startWorker = () => {
           );
 
           const processed = (result.uploadedFiles || []).map(normalizeKey);
-
           let index = 0;
+          const updates = {};
 
           if (profilePic) {
-            user.profilePic = processed[index++] || profilePic;
-
-            user.profilePicStatus = "COMPLETED";
+            updates.profilePic = processed[index++] || profilePic;
+            updates.profilePicStatus = "COMPLETED";
           }
-
           if (coverPic) {
-            user.coverPic = processed[index++] || coverPic;
-
-            user.coverPicStatus = "COMPLETED";
+            updates.coverPic = processed[index++] || coverPic;
+            updates.coverPicStatus = "COMPLETED";
           }
 
-          await user.save();
+          await User.updateOne({ _id: userId }, { $set: updates });
 
-          // Cache cleanup
           if (redis?.status === "ready") {
             await Promise.all([
               redis.del(`user:me:${userId}`),
@@ -406,23 +510,34 @@ export const startWorker = () => {
           }
 
           await publishProgress(userId, 100);
-
-          logger.info(`Profile media processing completed: ${userId}`);
-
+          logger.info({
+            event: "profile_media_processing_completed",
+            userId,
+          });
           return;
         }
 
-        logger.warn(`Unknown job type: ${name}`);
+        logger.warn({
+          event: "unknown_job_type",
+          name,
+        });
       } catch (err) {
-        logger.error(`❌ Job failed: ${job.id}`, err);
+        logger.error({
+          err,
+          jobId: job.id,
+          queue: job.queueName,
+          event: "job_failed",
+          postId: job.data?.postId,
+          revolutionId: job.data?.revolutionId,
+          userId: job.data?.userId,
+          kycId: job.data?.kycId,
+        });
 
         if (job.attemptsMade === job.opts.attempts - 1) {
           try {
             if (job.name === "media-processing") {
               await markFailed(job.data.postId);
               await publishProgress(job.data.postId, -1);
-
-              // Clean up cache on final failure too
               if (redis?.status === "ready") {
                 await redis.del(`post:${job.data.postId}`);
               }
@@ -435,42 +550,28 @@ export const startWorker = () => {
               );
               await publishProgress(job.data.revolutionId, -1);
             }
+
             if (job.name === "process-kyc-media") {
               await kycDocument.updateOne(
                 { _id: job.data.kycId },
-                {
-                  $set: {
-                    mediaStatus: "FAILED",
-                  },
-                },
+                { $set: { mediaStatus: "FAILED" } },
               );
-
               await publishProgress(job.data.kycId, -1);
             }
+
             if (job.name === "process-profile-media") {
               const updates = {};
-
-              if (job.data.profilePic) {
-                updates.profilePicStatus = "FAILED";
-              }
-
-              if (job.data.coverPic) {
-                updates.coverPicStatus = "FAILED";
-              }
-
-              await User.updateOne(
-                {
-                  _id: job.data.userId,
-                },
-                {
-                  $set: updates,
-                },
-              );
-
+              if (job.data.profilePic) updates.profilePicStatus = "FAILED";
+              if (job.data.coverPic) updates.coverPicStatus = "FAILED";
+              await User.updateOne({ _id: job.data.userId }, { $set: updates });
               await publishProgress(job.data.userId, -1);
             }
           } catch (e) {
-            logger.error("Failure handler error", e);
+            logger.error({
+              err: e,
+              event: "failure_handler",
+              jobId: job.id,
+            });
           }
         }
 
@@ -479,304 +580,68 @@ export const startWorker = () => {
     },
     {
       connection: redisQueueConfig,
-      concurrency: 2,
-      lockDuration: 300000,
+      concurrency: 3,
+      lockDuration: 900000,
+      lockRenewTime: 60000,
       stalledInterval: 30000,
       maxStalledCount: 1,
     },
   );
 
-  global.__mediaWorker.on("ready", () => console.log("🔥 Worker ready"));
+  global.__mediaWorker.on("ready", () =>
+    logger.info({
+      event: "worker_ready",
+    }),
+  );
   global.__mediaWorker.on("active", (job) =>
-    console.log("Processing:", job.id),
+    logger.info({
+      event: "job_processing",
+      jobId: job.id,
+      queue: job.queueName,
+    }),
   );
   global.__mediaWorker.on("completed", (job) =>
-    console.log("✅ Completed:", job.id),
+    logger.info({
+      event: "job_completed",
+      jobId: job.id,
+      queue: job.queueName,
+    }),
   );
-  global.__mediaWorker.on("failed", (job, err) =>
-    console.error("❌ Failed:", job?.id, err.message),
-  );
+  global.__mediaWorker.on("failed", (job, err) => {
+    logger.error({
+      event: "worker_failed",
+      err,
+      jobId: job?.id,
+      queue: job?.queueName,
+      attemptsMade: job?.attemptsMade,
+    });
+  });
   global.__mediaWorker.on("stalled", (jobId) => {
-    console.error("🚨 STALLED JOB:", jobId);
+    logger.error({
+      event: "job_stalled",
+      jobId,
+    });
   });
-
   global.__mediaWorker.on("error", (err) => {
-    console.error("🚨 WORKER ERROR:", err);
+    logger.fatal({
+      event: "worker_error",
+      err,
+    });
   });
 
-  console.log("Worker initialized");
+  logger.info({
+    event: "worker_initialized",
+  });
 };
 
 export const stopWorker = async () => {
-  if (global.__mediaWorker) {
-    await global.__mediaWorker.close();
-    global.__mediaWorker = null;
-  }
+  if (!global.__mediaWorker) return;
+
+  await global.__mediaWorker.close();
+
+  logger.info({
+    event: "worker_stopped",
+  });
+
+  global.__mediaWorker = null;
 };
-
-// import { Worker } from "bullmq";
-// import { redis, redisQueueConfig } from "../config/redis.js";
-// import { processMedia } from "../services/media.service.js";
-// import { markCompleted, markFailed } from "../services/post.service.js";
-// import { logger } from "../utils/logger.js";
-// import { Post } from "../models/post.model.js";
-// import { Revolution } from "../models/revolution.model.js";
-
-// const QUEUE_NAME = "media-processing";
-
-// /* ------------------ SINGLE WORKER ------------------ */
-
-// if (!global.__mediaWorker) global.__mediaWorker = null;
-
-// /* ------------------ HELPERS ------------------ */
-
-// const publishProgress = async (key, progress) => {
-//   try {
-//     if (redis?.status !== "ready") return;
-//     await redis.set(`progress:${key}`, progress, "EX", 600);
-//   } catch (err) {
-//     logger.warn("Progress error", err.message);
-//   }
-// };
-
-// const withTimeout = (promise, ms = 900000) =>
-//   Promise.race([
-//     promise,
-//     new Promise((_, reject) =>
-//       setTimeout(() => reject(new Error("Processing timeout")), ms),
-//     ),
-//   ]);
-
-// const normalizeKey = (url) => {
-//   if (!url) return null;
-//   if (!url.startsWith("http")) return url;
-
-//   try {
-//     const parsed = new URL(url);
-//     return parsed.searchParams.get("key") || url;
-//   } catch {
-//     return url;
-//   }
-// };
-
-// /* ------------------ WORKER ------------------ */
-
-// export const startWorker = () => {
-//   if (global.__mediaWorker) {
-//     console.log("Worker already running");
-//     return;
-//   }
-
-//   global.__mediaWorker = new Worker(
-//     QUEUE_NAME,
-//     async (job) => {
-//       const { name, data } = job;
-
-//       console.log("⚡ Job:", job.id, name);
-
-//       try {
-//         if (name === "media-processing") {
-//           const { postId, images, video, version } = data;
-
-//           const post = await Post.findById(postId).lean();
-
-//           if (!post) {
-//             logger.warn(`Post deleted, skipping job: ${postId}`);
-//             return;
-//           }
-
-//           if (version && post.mediaVersion && version < post.mediaVersion) {
-//             logger.info(`Skipping stale post job: ${postId}`);
-//             return;
-//           }
-
-//           await publishProgress(postId, 10);
-
-//           let last = 10;
-
-//           const result = await withTimeout(
-//             processMedia({
-//               images,
-//               video,
-//               onProgress: async (p) => {
-//                 if (p >= last + 10 || p === 100) {
-//                   last = p;
-//                   await publishProgress(postId, p);
-//                 }
-//               },
-//             }),
-//           );
-
-//           const cleanImages = (result.uploadedImages || []).map(normalizeKey);
-//           const cleanVideo = normalizeKey(result.uploadedVideo);
-
-//           const updatedPost = await markCompleted(
-//             postId,
-//             cleanImages,
-//             cleanVideo,
-//           );
-
-//           // /* ---------- REDIS ---------- */
-//           // if (updatedPost && redis?.status === "ready") {
-//           //   const obj = updatedPost.toObject();
-
-//           //   await redis.set(`post:${postId}`, JSON.stringify(obj), "EX", 3600);
-
-//           //   const score = new Date(obj.createdAt).getTime();
-//           //   await redis.zadd("feed:public", score, postId.toString());
-//           // }
-
-//           /* ---------- O(1) CACHE INVALIDATION ---------- */
-//           if (redis?.status === "ready") {
-//             await Promise.all([
-//               redis.incr("publicfeed:version"), // replaces invalidatePattern
-//               redis.del(`post:${postId}`), // still required
-//             ]);
-//           }
-
-//           /* ---------- RE-CACHE ---------- */
-//           if (updatedPost && redis?.status === "ready") {
-//             const obj = updatedPost.toObject();
-
-//             await redis.set(`post:${postId}`, JSON.stringify(obj), "EX", 3600);
-
-//             const score = new Date(obj.createdAt).getTime();
-//             await redis.zadd("feed:public", score, postId.toString());
-//           }
-
-//           await publishProgress(postId, 100);
-//           return;
-//         }
-
-//         if (name === "process-revolution-media") {
-//           const { revolutionId, rawFiles, version } = data;
-
-//           const revolution = await Revolution.findById(revolutionId);
-//           if (!revolution) return;
-
-//           if (
-//             version &&
-//             revolution.mediaVersion &&
-//             version < revolution.mediaVersion
-//           ) {
-//             logger.info(`Skipping stale revolution job: ${revolutionId}`);
-//             return;
-//           }
-
-//           await publishProgress(revolutionId, 10);
-
-//           let last = 10;
-
-//           const result = await withTimeout(
-//             processMedia({
-//               files: rawFiles,
-//               onProgress: async (p) => {
-//                 if (p >= last + 10 || p === 100) {
-//                   last = p;
-//                   await publishProgress(revolutionId, p);
-//                 }
-//               },
-//             }),
-//           );
-
-//           const processed = (result.uploadedFiles || []).map(normalizeKey);
-
-//           revolution.files.processed = processed;
-//           revolution.mediaStatus = "COMPLETED";
-
-//           await revolution.save();
-
-//           // /* ---------- REDIS ---------- */
-//           // if (redis?.status === "ready") {
-//           //   await redis.set(
-//           //     `revolution:${revolutionId}`,
-//           //     JSON.stringify(revolution.toObject()),
-//           //     "EX",
-//           //     3600,
-//           //   );
-//           // }
-
-//           /* ---------- CACHE INVALIDATION ---------- */
-//           if (redis?.status === "ready") {
-//             await Promise.all([
-//               redis.incr("revolutionfeed:version"), // O(1) invalidate all revolution feed caches
-//               redis.del(`revolution:${revolutionId}`), // remove stale PROCESSING cache
-//             ]);
-//           }
-
-//           /* ---------- RE-CACHE (OPTIONAL BUT GOOD) ---------- */
-//           if (redis?.status === "ready") {
-//             await redis.set(
-//               `revolution:${revolutionId}`,
-//               JSON.stringify(revolution.toObject()),
-//               "EX",
-//               3600,
-//             );
-//           }
-
-//           await publishProgress(revolutionId, 100);
-//           return;
-//         }
-
-//         logger.warn(`Unknown job type: ${name}`);
-//       } catch (err) {
-//         logger.error(`❌ Job failed: ${job.id}`, err);
-
-//         /* ---------- FINAL FAILURE ---------- */
-//         if (job.attemptsMade === job.opts.attempts - 1) {
-//           try {
-//             if (job.name === "media-processing") {
-//               await markFailed(job.data.postId);
-//               await publishProgress(job.data.postId, -1);
-//             }
-
-//             if (job.name === "process-revolution-media") {
-//               await Revolution.updateOne(
-//                 { _id: job.data.revolutionId },
-//                 { $set: { mediaStatus: "FAILED" } },
-//               );
-
-//               await publishProgress(job.data.revolutionId, -1);
-//             }
-//           } catch (e) {
-//             logger.error("Failure handler error", e);
-//           }
-//         }
-
-//         throw err;
-//       }
-//     },
-//     {
-//       connection: redisQueueConfig,
-//       concurrency: 1,
-//       lockDuration: 600000,
-//     },
-//   );
-
-//   /* ------------------ EVENTS ------------------ */
-
-//   global.__mediaWorker.on("ready", () => console.log("🔥 Worker ready"));
-
-//   global.__mediaWorker.on("active", (job) =>
-//     console.log("Processing:", job.id),
-//   );
-
-//   global.__mediaWorker.on("completed", (job) =>
-//     console.log("✅ Completed:", job.id),
-//   );
-
-//   global.__mediaWorker.on("failed", (job, err) =>
-//     console.error("❌ Failed:", job?.id, err.message),
-//   );
-
-//   console.log("Worker initialized");
-// };
-
-// /* ------------------ STOP ------------------ */
-
-// export const stopWorker = async () => {
-//   if (global.__mediaWorker) {
-//     await global.__mediaWorker.close();
-//     global.__mediaWorker = null;
-//   }
-// };
