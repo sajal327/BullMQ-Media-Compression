@@ -1,19 +1,27 @@
 import { Post } from "../models/post.model.js";
 
-export const markCompleted = async (postId, images, video) => {
+export const markCompleted = async (
+  postId,
+  images,
+  imageThumbnails,
+  video,
+  videoThumbnail,
+) => {
   await Post.findByIdAndUpdate(postId, {
     $set: {
       images,
+      imageThumbnails,
+
       video,
+      videoThumbnail,
+
       mediaStatus: "COMPLETED",
-      rawImages: [], // ← add
-      rawVideo: null, // ← add
+
+      rawImages: [],
+      rawVideo: null,
     },
   });
 
-  // Re-fetch with user populated so the worker can cache a valid object.
-  // findByIdAndUpdate with { new: true } returns the doc but user is a raw
-  // ObjectId — every downstream cache check (parsed.user._id) would fail.
   return Post.findById(postId)
     .populate({
       path: "user",
@@ -31,27 +39,3 @@ export const markFailed = async (postId) => {
     },
   });
 };
-
-// import { Post } from "../models/post.model.js";
-
-// export const markCompleted = async (postId, images, video) => {
-//   return Post.findByIdAndUpdate(
-//     postId,
-//     {
-//       $set: {
-//         images,
-//         video,
-//         mediaStatus: "COMPLETED",
-//       },
-//     },
-//     { new: true },
-//   );
-// };
-
-// export const markFailed = async (postId) => {
-//   return Post.findByIdAndUpdate(postId, {
-//     $set: {
-//       mediaStatus: "FAILED",
-//     },
-//   });
-// };
