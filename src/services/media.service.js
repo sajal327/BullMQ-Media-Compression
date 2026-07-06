@@ -2,35 +2,54 @@ import path from "path";
 import os from "os";
 import crypto from "crypto";
 import fs from "fs";
-
+import { logger } from "../utils/logger.js";
 import { uploadFile } from "./upload.service.js";
-
 import { downloadFromS3 } from "../utils/s3Download.js";
 import { safeUnlink } from "../utils/cleanup.js";
 import { retry } from "../utils/retry.js";
 import { deleteFromS3 } from "../utils/s3Delete.js";
-
 import { compressImageAdaptive } from "../processors/image.processor.js";
 import { compressVideoAdaptive } from "../processors/video.processor.js";
+import { createImageThumbnail } from "../processors/image.thumbnail.js";
+import { createVideoThumbnail } from "../processors/video.thumbnail.js";
+
+const normalizeKey = (url) => {
+  if (!url) return null;
+  if (!url.startsWith("http")) return url;
+  try {
+    const parsed = new URL(url);
+    return parsed.searchParams.get("key") || url;
+  } catch {
+    return url;
+  }
+};
 
 export const processMedia = async ({
-  // POSTS
   images = [],
   video = null,
-
-  // REVOLUTION / KYC / FUTURE
   files = [],
-
   imageUploadPath = "feeds/images",
   videoUploadPath = "feeds/videos",
-
   onProgress = () => {},
+  onEarlyImageThumbnails = null,
+  onEarlyVideoThumbnail = null,
 }) => {
+  logger.info({
+    event: "process_media_started",
+    imageCount: images?.length ?? 0,
+    videoCount: video ? 1 : 0,
+    filesCount: files?.length ?? 0,
+    imageUploadPath,
+    videoUploadPath,
+  });
+
   const uploadedImages = [];
   const uploadedFiles = [];
   const uploadedVideos = [];
 
   let uploadedVideo = null;
+  const uploadedImageThumbnails = [];
+  let uploadedVideoThumbnail = null;
 
   const tmpDir = os.tmpdir();
 
@@ -54,6 +73,12 @@ export const processMedia = async ({
         ? [video]
         : [];
 
+  logger.info({
+    event: "media_files_detected",
+    imageCount: imageList.length,
+    videoCount: videoList.length,
+  });
+
   // ----------------------------------------------------
   // PROCESS IMAGES
   // ----------------------------------------------------
@@ -62,105 +87,122 @@ export const processMedia = async ({
 
   for (let i = 0; i < totalImages; i++) {
     const imgKey = imageList[i];
-
     const uniqueName = `${Date.now()}-${crypto.randomUUID()}`;
-
     const ext = path.extname(imgKey) || ".jpg";
-
     const localPath = path.join(tmpDir, `${uniqueName}${ext}`);
 
     let compressed = null;
+    let thumbnail = null;
 
     try {
+      // 1. Download
+      const downloadStart = Date.now();
       await retry(() => downloadFromS3(imgKey, localPath));
+      logger.debug({
+        event: "image_downloaded",
+        key: imgKey,
+        index: i + 1,
+        total: totalImages,
+        durationMs: Date.now() - downloadStart,
+      });
 
+      // 2. Compress
+      const compressStart = Date.now();
       compressed = await retry(() => compressImageAdaptive(localPath));
+      logger.debug({
+        event: "image_compressed",
+        key: imgKey,
+        index: i + 1,
+        total: totalImages,
+        durationMs: Date.now() - compressStart,
+      });
 
-      const key = await retry(() => uploadFile(compressed, imageUploadPath));
+      // 3. Generate thumbnail from compressed
+      const thumbStart = Date.now();
+      thumbnail = await retry(() => createImageThumbnail(compressed));
+      logger.debug({
+        event: "image_thumbnail_created",
+        key: imgKey,
+        index: i + 1,
+        total: totalImages,
+        durationMs: Date.now() - thumbStart,
+      });
 
-      uploadedImages.push(key);
-      uploadedFiles.push(key);
+      // 4. Upload thumbnail + compressed in parallel
+      const uploadStart = Date.now();
+      const [thumbKey, key] = await Promise.all([
+        retry(() => uploadFile(thumbnail, "feeds/thumbnails/images")),
+        retry(() => uploadFile(compressed, imageUploadPath)),
+      ]);
+      logger.debug({
+        event: "image_uploaded",
+        key: imgKey,
+        compressedKey: key,
+        thumbnailKey: thumbKey,
+        index: i + 1,
+        total: totalImages,
+        durationMs: Date.now() - uploadStart,
+      });
 
-      await deleteFromS3(imgKey);
+      const normalizedKey = normalizeKey(key);
+      const normalizedThumb = normalizeKey(thumbKey);
 
-      const percent = Math.min(
-        Math.round(((i + 1) / Math.max(totalImages, 1)) * 50),
-        50,
-      );
+      uploadedImages.push(normalizedKey);
+      uploadedImageThumbnails.push(normalizedThumb);
+      uploadedFiles.push(normalizedKey);
 
-      await onProgress(percent);
-
-      await safeUnlink(localPath);
-
-      if (compressed) {
-        await safeUnlink(compressed);
+      // 5. Fire early callback — non‑blocking, safely handles sync/async
+      if (onEarlyImageThumbnails) {
+        Promise.resolve(
+          onEarlyImageThumbnails([...uploadedImageThumbnails]),
+        ).catch((err) => {
+          logger.warn({
+            event: "early_thumbnail_callback_failed",
+            err,
+          });
+        });
       }
+
+      // 6. Delete original – awaited with retry
+      const deleteStart = Date.now();
+      await retry(() => deleteFromS3(imgKey));
+      logger.debug({
+        event: "original_image_deleted",
+        key: imgKey,
+        index: i + 1,
+        total: totalImages,
+        durationMs: Date.now() - deleteStart,
+      });
+
+      // Progress: first 50% is images
+      const progress = Math.min(Math.round(((i + 1) / totalImages) * 50), 50);
+      await onProgress(progress);
+
+      // Cleanup temp files
+      await safeUnlink(localPath).catch(() => {});
+      await safeUnlink(compressed).catch(() => {});
+      await safeUnlink(thumbnail).catch(() => {});
     } catch (err) {
-      await safeUnlink(localPath);
+      logger.error({
+        event: "image_processing_failed",
+        key: imgKey,
+        index: i + 1,
+        total: totalImages,
+        err,
+      });
 
-      if (compressed) {
-        await safeUnlink(compressed);
-      }
+      await safeUnlink(localPath).catch(() => {});
+      if (compressed) await safeUnlink(compressed).catch(() => {});
+      if (thumbnail) await safeUnlink(thumbnail).catch(() => {});
 
       throw err;
     }
   }
 
-  // ----------------------------------------------------
-  // PROCESS VIDEOS
-  // ----------------------------------------------------
-
-  // const totalVideos = videoList.length;
-
-  // for (let i = 0; i < totalVideos; i++) {
-  //   const videoKey = videoList[i];
-
-  //   const uniqueName = `${Date.now()}-${crypto.randomUUID()}`;
-
-  //   const ext = path.extname(videoKey) || ".mp4";
-
-  //   const localPath = path.join(tmpDir, `${uniqueName}${ext}`);
-
-  //   let compressed = null;
-
-  //   try {
-  //     await retry(() => downloadFromS3(videoKey, localPath));
-
-  //     await onProgress(70);
-
-  //     compressed = await retry(() => compressVideoAdaptive(localPath));
-
-  //     const uploadedKey = await retry(() =>
-  //       uploadFile(compressed, videoUploadPath),
-  //     );
-
-  //     uploadedVideos.push(uploadedKey);
-  //     uploadedFiles.push(uploadedKey);
-
-  //     // Backward compatibility for Posts
-  //     if (!uploadedVideo) {
-  //       uploadedVideo = uploadedKey;
-  //     }
-
-  //     await deleteFromS3(videoKey);
-
-  //     await onProgress(95);
-
-  //     await safeUnlink(localPath);
-
-  //     if (compressed) {
-  //       await safeUnlink(compressed);
-  //     }
-  //   } catch (err) {
-  //     await safeUnlink(localPath);
-
-  //     if (compressed) {
-  //       await safeUnlink(compressed);
-  //     }
-
-  //     throw err;
-  //   }
-  // }
+  // If no images, push progress to 50% anyway
+  if (totalImages === 0) {
+    await onProgress(50);
+  }
 
   // ----------------------------------------------------
   // PROCESS VIDEOS
@@ -170,272 +212,156 @@ export const processMedia = async ({
 
   for (let i = 0; i < totalVideos; i++) {
     const videoKey = videoList[i];
-
     const uniqueName = `${Date.now()}-${crypto.randomUUID()}`;
-
     const ext = path.extname(videoKey) || ".mp4";
-
     const localPath = path.join(tmpDir, `${uniqueName}${ext}`);
 
     let compressed = null;
+    let thumbnail = null;
 
     try {
-      // console.log("\n========== VIDEO PROCESSING START ==========");
-      // console.log("Original S3 Key:", videoKey);
-      // console.log("Local Path:", localPath);
-
+      // 1. Download
+      const downloadStart = Date.now();
       await retry(() => downloadFromS3(videoKey, localPath));
+      const stat = await fs.promises.stat(localPath);
+      logger.debug({
+        event: "video_downloaded",
+        key: videoKey,
+        index: i + 1,
+        total: totalVideos,
+        sizeMB: (stat.size / 1024 / 1024).toFixed(2),
+        durationMs: Date.now() - downloadStart,
+      });
 
-      const downloadedStat = await fs.promises.stat(localPath);
+      await onProgress(50);
 
-      // console.log(
-      //   "Downloaded Size:",
-      //   (downloadedStat.size / 1024 / 1024).toFixed(2),
-      //   "MB",
-      // );
+      // 2. Generate thumbnail from original (before compression)
+      const thumbStart = Date.now();
+      thumbnail = await retry(() => createVideoThumbnail(localPath));
+      logger.debug({
+        event: "video_thumbnail_created",
+        key: videoKey,
+        index: i + 1,
+        total: totalVideos,
+        durationMs: Date.now() - thumbStart,
+      });
 
-      await onProgress(70);
+      // 3. Upload thumbnail immediately
+      const uploadThumbStart = Date.now();
+      const thumbKey = await retry(() =>
+        uploadFile(thumbnail, "feeds/thumbnails/videos"),
+      );
+      logger.debug({
+        event: "video_thumbnail_uploaded",
+        key: videoKey,
+        thumbnailKey: thumbKey,
+        index: i + 1,
+        total: totalVideos,
+        durationMs: Date.now() - uploadThumbStart,
+      });
 
-      // console.log("Starting compression...");
+      const normalizedThumb = normalizeKey(thumbKey);
+      uploadedVideoThumbnail = normalizedThumb;
 
+      // 4. Fire early callback — non‑blocking, safely handles sync/async
+      if (onEarlyVideoThumbnail) {
+        Promise.resolve(onEarlyVideoThumbnail(normalizedThumb)).catch((err) => {
+          logger.warn({
+            event: "early_video_thumbnail_callback_failed",
+            err,
+          });
+        });
+      }
+
+      await onProgress(60);
+
+      // 5. Compress (longest step)
+      const compressStart = Date.now();
       compressed = await retry(() => compressVideoAdaptive(localPath));
+      const compStat = await fs.promises.stat(compressed);
+      logger.debug({
+        event: "video_compressed",
+        key: videoKey,
+        index: i + 1,
+        total: totalVideos,
+        sizeMB: (compStat.size / 1024 / 1024).toFixed(2),
+        durationMs: Date.now() - compressStart,
+      });
 
-      const compressedStat = await fs.promises.stat(compressed);
+      await onProgress(85);
 
-      // console.log("Compressed File:", compressed);
-
-      // console.log(
-      //   "Compressed Size:",
-      //   (compressedStat.size / 1024 / 1024).toFixed(2),
-      //   "MB",
-      // );
-
-      // console.log(
-      //   "Reduction:",
-      //   ((1 - compressedStat.size / downloadedStat.size) * 100).toFixed(2) +
-      //     "%",
-      // );
-
-      // console.log("Uploading compressed file...");
-
+      // 6. Upload compressed
+      const uploadCompStart = Date.now();
       const uploadedKey = await retry(() =>
         uploadFile(compressed, videoUploadPath),
       );
+      logger.debug({
+        event: "video_compressed_uploaded",
+        key: videoKey,
+        compressedKey: uploadedKey,
+        index: i + 1,
+        total: totalVideos,
+        durationMs: Date.now() - uploadCompStart,
+      });
 
-      // console.log("Uploaded Key:", uploadedKey);
-
-      uploadedVideos.push(uploadedKey);
-      uploadedFiles.push(uploadedKey);
-
-      // Backward compatibility for Posts
+      const normalizedKey = normalizeKey(uploadedKey);
+      uploadedVideos.push(normalizedKey);
+      uploadedFiles.push(normalizedKey);
       if (!uploadedVideo) {
-        uploadedVideo = uploadedKey;
+        uploadedVideo = normalizedKey;
       }
 
-      // console.log("Deleting original video from Spaces...");
-      // console.log("Original Key:", videoKey);
-
-      await deleteFromS3(videoKey);
-
-      // console.log("Original deleted successfully");
+      // 7. Delete original – awaited with retry
+      const deleteStart = Date.now();
+      await retry(() => deleteFromS3(videoKey));
+      logger.debug({
+        event: "original_video_deleted",
+        key: videoKey,
+        index: i + 1,
+        total: totalVideos,
+        durationMs: Date.now() - deleteStart,
+      });
 
       await onProgress(95);
 
-      await safeUnlink(localPath);
-
-      if (compressed) {
-        await safeUnlink(compressed);
-      }
-
-      // console.log("Temporary files removed");
+      // Cleanup temp files
+      await safeUnlink(localPath).catch(() => {});
+      await safeUnlink(compressed).catch(() => {});
+      await safeUnlink(thumbnail).catch(() => {});
     } catch (err) {
-      console.error(err);
+      logger.error({
+        event: "video_processing_failed",
+        key: videoKey,
+        index: i + 1,
+        total: totalVideos,
+        err,
+      });
 
-      await safeUnlink(localPath);
-
-      if (compressed) {
-        await safeUnlink(compressed);
-      }
+      await safeUnlink(localPath).catch(() => {});
+      if (compressed) await safeUnlink(compressed).catch(() => {});
+      if (thumbnail) await safeUnlink(thumbnail).catch(() => {});
 
       throw err;
     }
   }
 
+  // If no videos, we still progress to 100
   await onProgress(100);
+
+  logger.info({
+    event: "process_media_completed",
+    uploadedImageCount: uploadedImages.length,
+    uploadedThumbnailCount: uploadedImageThumbnails.length,
+    uploadedVideoCount: uploadedVideos.length,
+    hasVideoThumbnail: !!uploadedVideoThumbnail,
+  });
 
   return {
     uploadedImages,
+    uploadedImageThumbnails,
     uploadedFiles,
     uploadedVideos,
     uploadedVideo,
+    uploadedVideoThumbnail,
   };
 };
-
-// import path from "path";
-// import os from "os";
-// import crypto from "crypto";
-
-// import { uploadFile } from "./upload.service.js";
-
-// import { downloadFromS3 } from "../utils/s3Download.js";
-// import { safeUnlink } from "../utils/cleanup.js";
-// import { retry } from "../utils/retry.js";
-// import { deleteFromS3 } from "../utils/s3Delete.js";
-
-// import { compressImageAdaptive } from "../processors/image.processor.js";
-// import { compressVideoAdaptive } from "../processors/video.processor.js";
-
-// // ─────────────────────────────────────────────────────────────
-// // PROCESS MEDIA
-// // Supports:
-// // - Posts
-// // - KYC Documents
-// // - Revolutions
-// // - Future media types
-// // ─────────────────────────────────────────────────────────────
-
-// export const processMedia = async ({
-//   // POSTS
-//   images = [],
-//   video = null,
-
-//   // GENERIC FILES (KYC / REVOLUTION / FUTURE)
-//   files = [],
-
-//   // CUSTOM UPLOAD PATHS
-//   imageUploadPath = "feeds/images",
-//   videoUploadPath = "feeds/videos",
-
-//   onProgress = () => {},
-// }) => {
-//   const uploadedImages = [];
-//   const uploadedFiles = [];
-
-//   let uploadedVideo = null;
-
-//   const tmpDir = os.tmpdir();
-
-//   const imageList = files.length > 0 ? files : images;
-
-//   // PROCESS IMAGES ─────────────────────────────────────────────────────
-
-//   const totalImages = imageList.length;
-
-//   for (let i = 0; i < totalImages; i++) {
-//     const imgKey = imageList[i];
-
-//     const uniqueName = `${Date.now()}-${crypto.randomUUID()}`;
-
-//     // Dynamic extension support
-//     const ext = path.extname(imgKey) || ".jpg";
-
-//     const localPath = path.join(tmpDir, `${uniqueName}${ext}`);
-
-//     let compressed = null;
-
-//     try {
-//       // Download RAW from S3 ─────────────────────────────
-
-//       await retry(() => downloadFromS3(imgKey, localPath));
-
-//       // Compress image ─────────────────────────────
-
-//       compressed = await retry(() => compressImageAdaptive(localPath));
-
-//       // Upload compressed image ─────────────────────────────
-
-//       const key = await retry(() => uploadFile(compressed, imageUploadPath));
-
-//       uploadedImages.push(key);
-//       uploadedFiles.push(key);
-
-//       // Delete RAW S3 file ─────────────────────────────
-
-//       await deleteFromS3(imgKey);
-
-//       // Progress update ─────────────────────────────
-
-//       const percent = Math.min(Math.round(((i + 1) / totalImages) * 80), 80);
-
-//       await onProgress(percent);
-
-//       // Cleanup temp files ─────────────────────────────
-
-//       await safeUnlink(localPath);
-
-//       if (compressed) {
-//         await safeUnlink(compressed);
-//       }
-//     } catch (err) {
-//       // Cleanup on failure
-
-//       await safeUnlink(localPath);
-
-//       if (compressed) {
-//         await safeUnlink(compressed);
-//       }
-
-//       throw err;
-//     }
-//   }
-
-//   // PROCESS VIDEO ─────────────────────────────────────────────────────
-
-//   if (video) {
-//     const uniqueName = `${Date.now()}-${crypto.randomUUID()}`;
-
-//     const ext = path.extname(video) || ".mp4";
-
-//     const localPath = path.join(tmpDir, `${uniqueName}${ext}`);
-
-//     let compressed = null;
-
-//     try {
-//       // Download RAW video ─────────────────────────────
-
-//       await retry(() => downloadFromS3(video, localPath));
-
-//       await onProgress(70);
-
-//       // Compress video ─────────────────────────────
-
-//       compressed = await retry(() => compressVideoAdaptive(localPath));
-
-//       // Upload compressed video ─────────────────────────────
-
-//       uploadedVideo = await retry(() =>
-//         uploadFile(compressed, videoUploadPath),
-//       );
-
-//       // Delete RAW video ─────────────────────────────
-
-//       await deleteFromS3(video);
-
-//       await onProgress(95);
-
-//       // Cleanup ─────────────────────────────
-
-//       await safeUnlink(localPath);
-
-//       if (compressed) {
-//         await safeUnlink(compressed);
-//       }
-//     } catch (err) {
-//       await safeUnlink(localPath);
-
-//       if (compressed) {
-//         await safeUnlink(compressed);
-//       }
-
-//       throw err;
-//     }
-//   }
-
-//   // FINAL RESPONSE ─────────────────────────────────────────────────────
-
-//   return {
-//     uploadedImages,
-//     uploadedFiles,
-//     uploadedVideo,
-//   };
-// };
